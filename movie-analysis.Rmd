@@ -1,0 +1,779 @@
+---
+title: "Predicting and Exploring IMDB's Ratings"
+author:
+- Juan Borgnino (jb3852)
+- Carolyn Morris (cm3491)
+- Jose Ramirez (jdr2162)
+- Manuel Rueda (mr3523)
+date: "December 15, 2015"
+output: pdf_document
+geometry: margin=0.8in
+abstract: |
+  In this analysis, we take IMDB's movie rating and descriptive data, combine it with the Academy Awards Best Picture nominations, and derive a model to predict highly rated movies. For this we test linear, polynomial, splines and General Additive Models. We identify our dataset as a complex one to model, so more flexible models performed better. In terms of inference, we found the number of votes was the best predictor, implying that more popular movies tend to be rated higher (or the other way around). Other variables such as the year of release, its length, budget and genre are also significantly related. Contrary to our expectations, 'Best Picture' nominations were not.
+---
+  
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.width=8, fig.height=4.5, echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+```{r Setup}
+library("gettingtothebottom")
+library("corrplot")
+library("GGally")
+library("ggfortify")
+library("reshape2")
+library("plyr")
+library("leaps")
+library("BSDA")
+library("boot")
+library("splines")
+library("gam")
+```
+
+
+```{r Data Processing}
+data("moviebudgets")
+## Remove the individual rating columns.
+movies <- moviebudgets[, !names(moviebudgets) %in% c("r1","r2","r3","r4","r5","r6","r7","r8","r9","r10")]
+movies$title <- as.character(movies$title)
+
+## Oscar awards.
+oscars <- read.csv("academy_awards.csv", stringsAsFactors = F)
+oscars$Year2 <- as.numeric(substr(oscars$Year, 0, 4))
+bestP <- oscars[oscars$Category == "Best Picture" & oscars$Year2 <= 2000,]
+movies$nominated <- rep(0, nrow(movies))
+movies[!is.na(match(gsub(", The", "", gsub('"', '', movies$title)), gsub("The ", "", bestP$Nominee))), "nominated"] =+ 1
+```
+
+#Data Sources
+
+Our dataset consists of movie rating and budget data for 5,183 films from the [Internet Movie Database](http://www.imdb.com/interfaces/), paired with a historical list of Academy Awards Best Picture Nominations, retrieved from [Agg Data](https://www.aggdata.com/awards/oscar). Both data sources are legally made available to the general public. For our analysis, we are interested in analyzing the interactions between IMDB ratings assigned by the general public and a list of other possible explanatory variables, which are listed on the following table.
+
+-------------------------------------------------------------
+Variable  Description
+--------- ---------------------------------------------------
+title     Title of the movie.
+
+year      Year the movie was released.
+
+budget    Total budget if in US dollars.
+
+length    Length of movie (in minutes).
+
+rating    Average IMDb user rating.
+
+votes     Number of IMDb users who rated the movie.
+
+mpaa      MPAA rating.
+
+nominated Binary variable indicating if the movie was
+          nominated for the 'Best Movie'.
+
+genre     Binary variables indicating whether movie belongs
+          to any of the following genres: action, animation,
+          comedy, drama, documentary, romance, short.
+------------------------------------------------------------
+  
+\pagebreak
+
+# Exploratory Data Analysis & Tests
+
+### Summary of Data
+Before beginning with the formal statistical analysis, it is convenient to perform exploratory analysis on the data to identify possible patterns. We begin by looking at the summary information for each of the variables.
+
+```{r Summary1 Statistics}
+summary(movies)
+
+genres <- c("Action", "Animation", "Comedy", "Drama", "Documentary", "Romance", "Short")
+```
+
+We see a couple of interesting things here:
+  
+(1) 25% of the movies have received less than 70 *votes*. We will remove this lower quantile, as we want to focus our attention on those films for which a larger consensus has been reached.
+(2) In the *length* column (below), we can see a cluster of short films on the right hand side of the plots. They clearly have a different behavior than full-feature ones, so we will exclude them from the analysis.
+(3) The *mpaa* variable has 4 categorical variables, each corresponding to a rating (e.g. PG-13). We will replace this with *mpnum* (0:N/A, 1:PG, 2:PG-13, 3:NC-17, 4:R).
+(4) The *budget* variable is defined on US dollars, but has not been adjusted for inflation. We will retrieve the yearly Consumer Price Index (CPI) data to convert this series into real terms.
+
+```{r Summary2, cache = T, fig.height=5.5}
+ggpairs(movies[,!names(movies) %in% c(genres, "title")], 
+        diag=list(continuous="density", discrete="bar"),
+        axisLabels="none", params=c(alpha=1/3))
+```
+
+```{r Data Cleaning}
+## Assign numerical variable to mpaa.
+mpMat <- data.frame(levels(movies$mpaa), c(1,4,2,3,5))
+names(mpMat) <- c("mpaa","mpnum")
+movies <- merge(movies, mpMat)
+movies = movies[, !names(movies) %in% c('mpaa')]
+
+## Remove movies with less than 70 votes.
+movies <- movies[movies$votes >= 70,]
+
+## Deflate budget variable.
+infl <- read.csv("infl.csv", stringsAsFactors = F)
+movies$adjBudget <- as.numeric(movies$budget / infl[match(movies$year, infl$Date),2] * 100, scientific=F)
+movies = movies[, !names(movies) %in% c('budget')]
+
+## Remove short films.
+movies <- movies[movies$Short == 0,]
+movies <- movies[, !names(movies) %in% c('Short')]
+
+## Remove titles column.
+movies <- movies[, !names(movies) %in% c('title')]
+```
+
+After proceeding with these changes, we identified one extreme outlier in terms of real budget: "Voyna i mir", or "War & Peace" (1966). Investigating this movie, we see that it was sponsored by the Soviet party, which covered its astronomical expenses. For the purposes of the analysis, we will omit it from the sample.
+
+```{r Voyna i mir, fig.width=6, fig.height=3}
+ggplot(data=movies, aes(adjBudget, votes)) + geom_point() + labs(x = "Adj. Budget", y = "Votes")
+## Remove outlying "Voyna i mir".
+movies <- movies[-which.max(movies$adjBudget),]
+```
+
+\pagebreak
+
+### Correlations Across Variables
+Now we present the charts of paired variables, along with a visual representation of the correlation matrix.
+
+```{r EDA}
+## All movies.
+allCorr <- cor(movies[1:ncol(movies)])
+
+cex.before <- par("cex")
+par(cex = 0.7, cex.axis = 0.7)
+corrplot(allCorr, method = "color", addCoef.col="black", order = "hclust", type="lower",
+         tl.cex = 1/par("cex"), cl.cex = 1/par("cex"), tl.col="black", addCoefasPercent = TRUE)
+par(cex = cex.before)
+```
+
+Here we can see a positive correlation between rating and *votes*, as well as rating and *nominated*. The correlation with *adjBudget* is surprisingly low, suggesting that this is not one of the main driving factors on explaining the user preference for a film. *Year* is also negatively correlated, although on the pairs plot this seems somewhat contradictory; the older movies have a rating concentration on the upper part of the spectrum. This is explained by the high density of recent movies that received rating: if we take the upper bound of ratings per year, we see that it increases with time:
+  
+```{r top RatingPerYear, fig.height=3}
+topRPY <- ddply(movies, "year", function(x) {max(x[3])})
+ggplot(topRPY, aes(x=year, y=V1)) + geom_line() + labs(x="Year", y="Top Rating") + geom_smooth()
+```
+
+Finally we see *length* positively correlated with *rating*, so we can expect longer movies to receive more love from the audience.
+
+Other interesting observations:
+  
+* Action & Animation movies tend to receive a high budget, which makes sense considering they rely intensively on special effects.
+
+* Dramas and Romance films tend to be nominated more frequently.
+
+* Dramas and Comedies don't tend to go together, while Comedies and Romance are a frequent mix (Rom-Coms).
+
+We are however mostly interested in how the IMDB rating of a movie can be predicted utilizing the rest of the variables, so we will restrict our attention to these specific interactions. An interesting exercise is to investigate how the ratings correlate with the rest of the variables, particularly the most significant ones (*votes, adjBudget, & nominations*) when splitting the dataset by genre, and for this we will make use of the **Test of Independence**, which is defined as follows:
+
+*Let $X$ and $Y$ have a bivariate normal distribution with means $\mu_1$ and $\mu_2$, positive variances $\sigma_1^2$ and $\sigma_2^2$, and correlation coefficient $\rho$. We wish to test the hypothesis that $X$ and $Y$ are independent.* We will use $R$, the sample estimate of $\rho$, to test the null hypothesis $H_0:\rho = 0$ against the alternative $H_1:\rho \neq 0$. For this we build the following statistic, which has a *t*-distribution with $n-2$ degrees of freedom.
+
+\begin{center}$T = \left(\frac{R\sqrt{n-1}}{\sqrt{1-R^2}}\right)$\end{center}
+
+We reject the null hypothesis with a level $\alpha$ if $|T| \geq t_{\alpha/2, n-2}$. This is equivalent to applying the `cor.test()` R function, however for completeness we have built our own function that will lead us to the same results.[^1] In our case we don't have evidence of normality in our variables, but we will assume so for practical purposes. Below are the results, per genre.
+
+```{r Test of Independence}
+## Melt the data to make the genres more readable.
+molten <- melt(movies, id.vars = c("year", "length","rating", "votes", "adjBudget",
+                                   "mpnum", "nominated"), variable.name = "genre")
+molten <- molten[!molten$value == 0,]
+
+## Loop to see on which genres budget, votes and rating are independent.
+## This is equivalent to the cor.test function.
+voteTest <- function(x) {
+  r <- cor(x$rating, x$votes)
+  t <- (r * sqrt(nrow(x)-2)) / (sqrt(1-r^2))
+  o <- data.frame(r,t, qt(0.05/2, nrow(x)-2), nrow(x), abs(t) > abs(qt(0.05/2, nrow(x)-2)),1 - pt(t, nrow(x)-2))
+  colnames(o) <- c("r", "t", "t-crit", "n", "sig?", "p-value")
+  o
+}
+
+budgetTest <- function(x) {
+  r <- cor(x$rating, x$adjBudget)
+  t <- (r * sqrt(nrow(x)-2)) / (sqrt(1-r^2))
+  o <- data.frame(r,t, qt(0.05/2, nrow(x)-2), nrow(x), abs(t) > abs(qt(0.05/2, nrow(x)-2)), 1 - pt(t, nrow(x)-2))
+  colnames(o) <- c("r", "t", "t-crit", "n", "sig?", "p-value")
+  o
+}
+
+oscarTest <- function(x) {
+  r <- cor(x$rating, x$nominated)
+  t <- (r * sqrt(nrow(x)-2)) / (sqrt(1-r^2))
+  o <- data.frame(r,t, qt(0.05/2, nrow(x)-2), nrow(x), abs(t) > abs(qt(0.05/2, nrow(x)-2)), 1 - pt(t, nrow(x)-2))
+  colnames(o) <- c("r", "t", "t-crit", "n", "sig?", "p-value")
+  o
+}
+
+cVotes <- ddply(.data=molten, .variables=.(genre), .fun=voteTest)
+print("rating vs. votes")
+cVotes
+
+cBudget <- ddply(.data=molten, .variables=.(genre), .fun=budgetTest)
+print("rating vs. budget")
+cBudget
+
+cOscar <- ddply(.data=molten, .variables=.(genre), .fun=oscarTest)
+print("rating vs. oscar")
+cOscar
+```
+
+\pagebreak
+
+The main observations from this analysis:
+  
+* The number of votes are highly correlated with the movie rating in all cases, except documentaries, where we have few observations.
+
+* Action and Animation movies tend to perform better in terms of rating when they have a higher budget. This is in line with our previous observations.
+
+* Movies that have been nominated for Best Picture also tend to receive better ratings. `NA`'s appear because some genres have not received this nomination at all.
+
+### Distribution of Ratings
+We have seen that ratings across different genres exhibit different correlations, and now we wish to investigate with more detail the distribution of votes among these different categories. First, we will comment on the median of this variable; can we say that it is below the centered-rating of 5 stars? A box plot of the data and the **Sign-Test** can help us investigate this.
+
+For the Sign-Test, we will test the following hypothesis:
+
+\begin{center}$H_0:\theta < 5$ vs. $H_1:\theta \geq 5$\end{center}
+
+The test can be performed via the `SIGN.test` function in R, but here we have decided to implement the function step by step.[^1]
+
+```{r Sign-Test}
+# Sign-Test with Small Sample.
+med <- 5
+set.seed(1)
+subset=sample(dim(movies)[1] ,size=30)
+y<-movies$rating[subset]
+print("Ratings subset:")
+print(z <- sort(y))
+print("Length of subset:")
+print(n <- length(z))
+print("Observations greater than 5:")
+print(b <- sum(z > med))
+print("p-value:")
+p_value=1-pbinom(b-1,n,.5)
+print(p_value)
+
+print("sample median:")
+trueMed <- median(y)
+trueMed
+# If p-value is less than 0.05 then H0 is rejected. The median is greater than 5.
+# SIGN.test(y, md = 5, alternative = "greater", conf.level = 0.95)
+```
+
+\pagebreak
+
+With this small *p-value*, we reject the null hypothesis of the median being less than 5 stars. Combining this information with a box plot:
+
+```{r Box Plot, fig.height =3.5}
+ggplot(molten, aes(x = genre, y = rating)) + geom_boxplot() +
+labs(x = "Genre", y = "Rating") + geom_hline(aes(yintercept=trueMed, color="navy"))
+```
+
+The graphical representation also confirms what the sign-test suggested. We see that votes tend to be concentrated on the upper part of the spectrum, with a median around 6.5. Most movies tend to be "good" ones, or they tend to be rated more. Now, we see some difference on the distributions across genres. We now wish to test if this difference is statistically significant. For this we will use the **Mann–Whitney–Wilcoxon** statistic on a couple of pairs, which will test for:
+
+\begin{center}$P(Y \leq y) = P(X + \Delta \leq y) = F(y - \Delta)$\end{center}
+
+\begin{center}$H_0:\Delta = 0$ vs. $H_1:\Delta \geq 0$\end{center}
+
+Under $H_0$, the distributions of $X$ and $Y$ are the same, and we can combine the samples to have one large sample of $n = n1 + n2$ observations. We will use the `wilcox.test()` command in R to perform this test. Below: statistic & P-Value.
+
+```{r}
+print("Drama & Comedy")
+w <- wilcox.test(rating ~ genre, data=molten[molten$genre %in% c("Drama","Comedy"),])
+cbind(w$statistic, w$p.value)
+print("Comedy & Romance")
+w <- wilcox.test(rating ~ genre, data=molten[molten$genre %in% c("Comedy","Romance"),])
+cbind(w$statistic, w$p.value)
+print("Action & Comedy")
+w <- wilcox.test(rating ~ genre, data=molten[molten$genre %in% c("Action","Comedy"),])
+cbind(w$statistic, w$p.value)
+```
+
+First, looking at Drama and Comedy, we see that indeed their distributions are statistically different, which was also suggested by the box plots, and we can relate back to the negative correlation observed between the variables (i.e. few Dramatic Comedies exist). Romance and Comedy however do tend to go together, but still the WHM test shows us that their distributions are different. Even for Action and Comedy, two genres on which the box plot suggest a similar distribution, we do not find the null hypothesis significant at $\alpha=0.01$.
+
+Given this, it is convenient to keep a distinction between movies of different categories. There are two ways to achieve this:
+
+* Subset the data into different groups, one per genre.
+
+* Keep binary variables to identify when a given film belongs to a specific genre.
+
+We have decided to take the second approach, since this way we don't reduce the sample size of categories such as Documentaries, and we can also account for movies on which more than one genre is present (i.e. Action + Animation, Romance + Comedy, etc.).
+
+# Statistical Modeling of Ratings
+
+Having completed the exploratory analysis of the data, we proceed to apply a number of statistical modeling techniques to predict the response rating. We first divide our data set into a training set, using 80% of the data, and test set. We will start by applying best subset selection, and then we will fit several models. For each model, we will provide a brief explanation of the method and a summary of the results obtained. 
+
+## Best Subset Selection
+
+Given that we have $12$ predictors, we use **Best Subset Selection** to decide what variables to include. This method allows us to fit a separate least squares regression for each possible combination of the $12$ predictors. Hence, we will fit in total $2^{12} = 4096$ models and choose the one with smallest Test MSE. It is important to notice that if the number of predictors was greater, we would have used **Forward Subset Selection** due to the lower computational costs.
+
+```{r Best Subset Selection}
+#Create Training set
+movies = data.frame(movies, log.votes = log(movies$votes))
+
+set.seed(1)
+train.index = sample(dim(movies)[1], round(dim(movies)[1]*0.8))
+test.index = c(1:dim(movies)[1])[-c(train.index)]
+train.set = movies[train.index, ]
+test.set = movies[test.index, ]
+
+mse.test.errors = vector()
+inter.column=rep(1,dim(test.set)[1])
+
+best.subset = regsubsets(rating ~., train.set[, !names(train.set) %in% c('log.votes')], nvmax = 12)
+```
+
+The following plot shows the test MSE for each of the separate best models of all sizes up to $12$ in terms of RSS.
+
+```{r Test MSE, fig.height=3}
+for(i in 1:(dim(train.set)[2] - 2)){
+  coef.best = coef(best.subset, id = i)
+  predic = as.matrix(cbind(inter.column,test.set[ , names(test.set) %in% c(names(coef.best))])) %*% coef.best[] 
+  errors = mean((test.set[,"rating"] - predic)^2)
+  mse.test.errors = cbind(mse.test.errors, errors)
+}
+
+qplot(x = c(1:(dim(train.set)[2] - 2)), y = as.numeric(mse.test.errors), main = 'Test MSE vs Number of Predictors', xlab = 'No. of Predictors',
+     ylab = 'Test MSE', geom = c("point", "path"))
+```
+
+## Linear Regression
+
+Next, we present a summary of the regression using the model obtained using **Best Subset Selection**. The included variables are: year, length, votes, Animation, Comedy, Drama, and adjBudget. Somewhat surprisingly, *nominated* was not found to be relevant, which could be explained by the fact that only a small fraction of the movies (5.66%) actually received a nomination.
+
+From the summary we observe the following points:
+
+* All p-values are smaller than 0.01 . Hence, we can reject the null hypothesis and conclude that the predictors are statistically significant and are related to the response.
+
+* We obtain an adjusted R squared value of 0.394, meaning that our model is explaining aprox. 40% of the variance of the rating.
+
+* The Test MSE is equal to 1.089. That is, on average our prediction is missing the true value of the response by 1.089.
+
+Some of the interpretation of the coefficients are:
+
+* A 1000 increase in votes, increases, on average and given that all other predictors are fixed, the rating by 0.041.
+
+* A 1,000,000 dollar increase in the budget of the movie, reduces, on average and given that all other predictors are fixed, the rating by -0.014.
+
+```{r BSS Diagnostics}
+lm.fit = lm(rating ~ year + length + votes + Animation + Comedy
+            + Drama + adjBudget, data = train.set)
+print('Test MSE:')
+min(mse.test.errors)
+summary(lm.fit)
+```
+
+We now look at several plots of the residuals in order to detect potential problems from our linear model.
+
+From the graph we find that the residuals exhibit a clear inverted U-shape, which provides a strong indication of non-linearity in the data. Therefore we should use some non-linear transformation of the predictors. 
+
+```{r fig.height=3}
+autoplot(lm.fit, alpha = 1/3, smooth.colour = 'black', smooth.linetype = 'dashed', label.size = 2)[1]
+```
+
+In order to take account for the non-linearity we found, we try taking the logarithm of the variable votes. Below, we plot the new residuals and confirm there is now no discernable pattern in the distribution of the errors. Hence, the true model seems to be non-linear.
+
+```{r Log-Linear Model, fig.height=3}
+lm.fit.log = lm(rating ~ year + length + I(log(votes)) + Animation + Comedy
+            + Drama + adjBudget, data = train.set)
+autoplot(lm.fit.log, alpha = 1/3, smooth.colour = 'black', smooth.linetype = 'dashed', label.size = 2)[1]
+```
+
+Finally, we substitute from our model the variable votes for the logarithm of votes and check if our models improves. From the new fit we find the following positives results:
+
+* The Test MSE has slightly decreased to 1.037.
+
+* The Adjusted R Squared increased to 0.478.
+
+To conclude, using the logarithm of votes seems to be improving the fit of our model. Hence, for the rest of the statistical learning methods we will apply, we will use this variable.
+
+```{r Log Linear Model MSE}
+print('Adj. R Squared:')
+summary(lm.fit.log)$adj.r.squared
+fit.log.predict = predict(lm.fit.log, newdata = test.set[, !names(test.set) %in% ('rating')])
+MSE.test = mean((test.set$rating - fit.log.predict)^2)
+print("Test MSE:")
+MSE.test
+```
+
+
+## Polynomial Regression
+
+We extend the linear regression model by replacing it with a polynomial function. That is, some of our predictors we will raised to a power. We determine which degree polynomial to implement with the Analysis of Variance (ANOVA). 
+
+ANOVA performs a hypothesis tests using an F-test to compare different models. The null hypothesis is that the two models are equally good explaining the data; the alternative hypothesis is that the more complex model has higher explanatory power. It is important to consider when performing the test that the models must be nested, i.e. model M1 is a subset of M2. If the p-value is greater than 0.05, then there is not enough evidence to reject the null, and we conclude that the simpler model, M1, is sufficient to explain the data.
+
+Next we use ANOVA to test on the model we obtained from the **Linear Regression** section the degree of polynomial to fit our model. Below we observe the results from our test.
+
+* With an F-statistic of 16 and p-value very close to zero, we have strong evidence to believe that the model which includes the cubic of the logarithm of votes is better than the model that only includes the logarithm of votes. 
+
+```{r Polynomial Regression}
+fit.1 = lm(rating ~ year + length + Animation + Comedy
+            + Drama + adjBudget  + log.votes, data = movies)
+fit.2 = lm(rating ~ year + length + Animation + Comedy
+            + Drama + adjBudget  + poly(log.votes,2), data = movies)
+fit.3 = lm(rating ~ year + length + Animation + Comedy
+            + Drama + adjBudget  + poly(log.votes,3), data = movies)
+fit.4 = lm(rating ~ year + length + Animation + Comedy
+            + Drama + adjBudget  + poly(log.votes,4), data = movies)
+fit.5 = lm(rating ~ year + length + Animation + Comedy
+            + Drama + adjBudget  + poly(log.votes,5), data = movies)
+anova(fit.1, fit.2, fit.3, fit.4, fit.5)
+```
+
+Finally, to confirm that the polnomial of degree 3 is the best model so far, we predict on our test set. We obtain a Test MSE of 0.991, which is an important improvement from the model without the cubic polynomial.
+
+```{r Poly D3}
+train.fit.3 = lm(rating ~ year + length + Animation + Comedy
+            + Drama + adjBudget  + poly(log.votes,3), data = train.set)
+
+test.fit.3 = predict(train.fit.3, newdata = test.set[, !names(test.set) %in% c('rating')])
+MSE.test.fit.3 = mean((test.set$rating - test.fit.3)^2)
+print("Test MSE:")
+MSE.test.fit.3
+
+```
+
+Before moving on to apply other methods, we take a closer look at the variable *votes*, since it seems to be a very important predictor for the response. We regress rating onto the cubic of the logarithms of votes and observe the following results:
+
+* The adjusted R squared is aprox 19%. Hence, this variable alone seems to be doing a good job explaining almost 20% of the variance of rating.
+
+* We obtain a test MSE of 1.4607. This a very good result considering that using all 7 variables we obtained a result of 0.991.
+
+```{r Votes P3}
+lm.log.votes.3 = lm(rating ~ poly(log.votes,3), data = movies)
+print('Adj. R Squared:')
+summary(lm.log.votes.3)$adj.r.squared
+poly.train = lm(rating ~ poly(log.votes, 3), data = train.set)
+poly.test = predict(poly.train, newdata = list(log.votes = test.set$log.votes))
+poly.error = mean((poly.test - test.set$rating)^2)
+print("Test MSE:")
+poly.error
+
+```
+
+To compare how linear regression and the cubic polynomial models only using the logarithm of votes fit the data we plot both curves. 
+The first graph is produced by fitting a polynomial of degree 3, while the graph on the right is produced by fitting a regular line. In both graphs, the blue line represents the fitted value from both models and the red lines an estimated 95% confidence interval.
+It is very clear how the polynomial of degree 3 allows us to fit a more flexible curve that fits the data better.
+
+```{r Votes P3 Details}
+par(mfrow = c(1,2))
+
+poly.fit = lm(rating ~ poly(log.votes, 3), data = movies)
+lm.votes.fit = lm(rating ~ log.votes, data = movies)
+vote.lims = range(movies$log.votes)
+vote.grid = seq(from=vote.lims[1], to=vote.lims[2])
+summary(poly.fit)
+
+predict.linear = predict(lm.votes.fit, newdata = list(log.votes = vote.grid), se = T)
+lin.bands = cbind(predict.linear$fit + 2*predict.linear$se,  predict.linear$fit - 2*predict.linear$se)
+predict.poly = predict(poly.fit, newdata = list(log.votes = vote.grid), se = T)
+se.bands = cbind(predict.poly$fit + 2*predict.poly$se,  predict.poly$fit - 2*predict.poly$se)
+
+plot(movies$log.votes, movies$rating, col = 'darkgrey', xlab = 'log(Votes)', ylab = 'Rating', main = 'Degree-3 Polynomial')
+lines(vote.grid, predict.poly$fit, lwd = 2, col = 'darkblue')
+matlines(vote.grid, se.bands, lwd = 2, col = 'red')
+
+plot(movies$log.votes, movies$rating, col = 'darkgrey', xlab = 'log(Votes)', ylab = 'Rating', main = 'Linear Regression')
+lines(vote.grid, predict.linear$fit, lwd = 2, col = 'darkblue')
+matlines(vote.grid, lin.bands, lwd = 2, col = 'red')
+```
+
+
+## Regression Splines
+
+Regression splines allow us to fit separate low-degree polynomials over different regions of our predictor. It is important to note the difference from the polynomial regression we just applied. Before, we imposed a global cubic polynomial to the data and now we will implement a piecewise polynomial to k knots (the points were the coefficients change). Therefore, it is clear that regression splines allow us to fit more flexible and complex models to our data. 
+
+## Cubic Spline
+We start by fitting a cubic spline to our data. We keep on using the logarithm of votes as our predictors since we obtained the best results using this variable. Also, keeping the same predictor, we can compare all the models.
+
+In order to determine the degrees of freedom, we use cross-validation to obtain an estimate of the test error for different degrees of freedom. We then choose the number which minimizes the error. We find that 7 degrees of freedom provide us the lowest estimated test error. This means that we will use 4 knots.
+
+```{r Cross Validation}
+set.seed(1)
+library(boot)
+cross.spline = rep(NA, 12)
+for (i in 5:16) {
+  fiting = glm(rating ~ bs(log.votes, df = i), data = movies)
+  cross.spline[i] = cv.glm(movies, fiting, K = 10)$delta[2]
+}
+spline.best.df = which.min(cross.spline)
+```
+
+The 4 points were we will fit the knots are:
+
+```{r Knots}
+attr(bs(log(movies$votes) ,df = spline.best.df) ,"knots") 
+```
+
+Next we fit a spline to the data. From the summary of the model we find the following results:
+
+* Almost all coefficients are statistically significant and related to the response.
+
+* The Adjusted R Squared is 0.1905: slightly higher than the cubic polynomial.
+
+```{r Splines}
+library(splines)
+spline.fit = lm(rating ~ bs(log.votes, df = spline.best.df), data = movies)
+spline.predict = predict(spline.fit, newdata = list(log.votes = vote.grid))
+print("Adj. R Squared:")
+summary(spline.fit)$adj.r.squared
+```
+
+Below we can observe a graph showing the estimated Test MSE for each degree of freedom. The graph on right shows how cubic spline has some additional flexibility compared the cubic polynomial.
+
+```{r fig.height = 4}
+par(mfrow=c(1,2))
+plot(5:16, cross.spline[-c(1,2,3,4)], type = 'b', lwd = 1, col = 'darkgreen', 
+     main = 'C.V. for D. of Freedom', xlab = 'Degrees of Freedom', ylab = 'Mean Squared Error',
+     ylim = c(1.42,1.49))
+
+plot(movies$log.votes, movies$rating, col = 'darkgrey', xlab = 'log(Votes)', ylab = 'Rating', main = 'Cubic Sline with 4 Knots')
+lines(vote.grid, spline.predict, col = 'red', lwd = 2)
+abline(v = c(attr(bs(movies$log.votes ,df=7) ,"knots") ), col = 'black', lty = 2, lwd = 1)
+lines(vote.grid, predict.poly$fit, lwd = 2, col = 'darkblue')
+legend('bottomright', c('Cubic Spline', 'Degree 3 Polynomial'), col = c('red', 'darkblue'), lty = c(1,1),
+       lwd = c(2,2), cex = 0.75)
+
+```
+
+
+In last place, we obtain a test MSE of 1.464 from the cubic spline model, that is slightly higher than the polynomial regression. It looks likes the additional flexibility could be increasing the error due to higher variance.
+
+```{r Splines Error}
+spline.train = lm(rating ~ bs(log.votes, df = spline.best.df), data = train.set)
+spline.test = predict(spline.train, newdata = list(log.votes = test.set$log.votes))
+spline.error = mean((spline.test - test.set$rating)^2)
+print("Test MSE:")
+spline.error
+```
+
+## Natural Cubic Spline
+A natural spline is a regression spline with an additional constraint: the function is required to be linear in the boundaries. The advantage of using a natural cubic spline is that usually in the boundaries there are less points. Hence, a polynomial can be quite unstable in the boundaries. 
+
+
+Like before, we start by using cross-validation to obtain the degrees of freedom which minimize the test error estimate.
+
+```{r Splines Validation}
+set.seed(1)
+cross.spline = rep(NA, 12)
+for (i in 5:16) {
+  fiting = glm(rating ~ ns(log.votes, df = i), data = movies)
+  cross.spline[i] = cv.glm(movies, fiting, K = 10)$delta[2]
+}
+ns.best.df = which.min(cross.spline)
+```
+
+We fit a natural cubic splin with 6 knots since we obtained 7 degrees of freedom from cross validation. From the summary of the fit we observe:
+
+* Almost the same adjusted R squared, 0.1908 than what we obtained from the cubic spline. 
+
+* Almost all coefficients are statistically significant.
+
+
+```{r Cubic Spline}
+par(mfrow = c(1,1))
+ns.fit = lm(rating ~ ns(log.votes, df = ns.best.df), data = movies)
+ns.predict = predict(ns.fit, newdata = list(log.votes = vote.grid), se = T)
+summary(ns.fit)
+```
+
+In addition, we graph both models and observe how the natural cubic spline has a little more flexibility due to the higher number of knots. However, we do not observe any improved performance. Particularly because in the boundaries there is still a large number of observations. As a result, the cubic spline is as stable as the natural cubic spline.
+
+```{r}
+par(mfrow = c(1,2))
+
+plot(5:16, cross.spline[-c(1,2,3,4)], type = 'b', lwd = 1, col = 'darkgreen', 
+     main = 'C.V. for D. of Freedom', xlab = 'Degrees of Freedom', ylab = 'Mean Squared Error',
+     ylim = c(1.42,1.49))
+
+
+plot(movies$log.votes, movies$rating, col = 'darkgrey', xlab = 'log(Votes)', ylab = 'Rating', main = 'Natural Spline with 6 Knots')
+lines(vote.grid, ns.predict$fit, col = 'red', lwd = 2)
+abline(v = c(attr(ns(movies$log.votes ,df=7) ,"knots")) , col = 'black', lty = 2, lwd = 2)
+lines(vote.grid, spline.predict, col = 'darkblue', lwd = 2)
+legend('bottomright', c('Nat. Cubic Spline', 'Cubic Spline'), col = c('red', 'darkblue'), lty = c(1,1), lwd = c(2,2), cex = 0.75)
+
+```
+
+We compute the test error and obtain 1.462. This is almost the same from what we obtained using the cubic spline. The conclusion is that the cubic spline is as stable as the natural cubic spline in the boundaries. In addition, the larger number of knots being used by the natural cubic spline is not providing any additional improvement.
+
+```{r Cubic Splines Details}
+ns.train = lm(rating ~ ns(log.votes, df = ns.best.df), data = train.set)
+ns.test = predict(ns.train, newdata = list(log.votes = test.set$log.votes))
+ns.error = mean((ns.test - test.set$rating)^2)
+print('Test MSE')
+ns.error
+```
+
+
+## Smoothing Spline
+
+Instead of determining a set of knots and fitting a different function on each one, we try to estimate a function g(x), which provides us with the desired flexibility. The function g(x) should fit the data well, minimizing the RSS, but nevertheless shouldn't be too rough. Therefore, we introduce a penalty term to control for how wiggly g(x) is. Finally, we tune the penalty using parameter lambda. Higher values of lambda force our function g(x) to be less flexible, 
+
+We start by using cross validation to obtain the lambda parameter which minimize the test error estimate. We obtain lambda = 9.047881.
+
+```{r Smoothing Spline}
+set.seed(1)
+smoothing.fit = smooth.spline(movies$log.votes, movies$rating, cv = T)
+smoothing.fit.16 = smooth.spline(movies$log.votes, movies$rating, df = 16)
+print('lambda C.V.')
+smoothing.fit$df
+```
+
+```{r}
+par(mfrow = c(1,1))
+plot(movies$log.votes, movies$rating, col = 'darkgrey', xlab = 'log(Votes)', ylab = 'Rating', main = 'Smoothing Splines')
+lines(smoothing.fit, col = 'red', lwd = 2)
+lines(smoothing.fit.16, col = 'darkblue', lwd = 2)
+
+legend('bottomright', c('9.04 Degrees of freedom (CV)', '16 Degrees of freedom'), col = c('red', 'darkblue'), lty = c(1,1), lwd = c(2,2), cex = 0.75)
+
+```
+
+
+We compute the test error and obtain 1.457. This model is obtaining a slightly better performance compared to the cubic and natural spline, but not compared to the polynomial regression with the best subset predictors.
+
+```{r Smoothing Spline Error}
+smoothing.train = smooth.spline(x = train.set$log.votes, y = train.set$rating, df = 9)
+smoothing.test = predict(smoothing.train, x = test.set$log.votes)$y
+smoothing.error = mean((smoothing.test - test.set$rating)^2)
+print('Test MSE')
+smoothing.error
+```
+
+### General Additive Models (GAMs)
+
+We will now explore General Additive Models (GAMs). These extend the multiple linear regression model by allowing non-linear functions of each variable. We calculate a different function for each variable, and add together all of their contributions. This results in potentially more accurate predictions for our response variable, the movie rating. Furthermore, since the model is additive, we can interpret the effects of each variable on the movie rating.    
+
+#### GAM with Smoothing Spline
+
+We use the predictors that were chosen in the best subset selection: year, length, votes, Animation, Comedy, Drama, and adjBudget. We use the 'gam' package in R to fit the models.
+```{r}
+fit.1 = gam(rating ~ year + length + votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.2 = gam(rating ~ s(year, df = 4) + length + votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.3 = gam(rating ~ s(year, df = 4) + s(length, df = 4) + votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.4 = gam(rating ~ s(year, df = 4) + s(length, df = 4) + s(votes, df = 4) + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.5 = gam(rating ~ s(year, df = 4) + s(length, df = 4) + s(votes, df = 4) + Animation + Comedy + Drama + s(adjBudget, df = 4), data = movies)
+anova(fit.1, fit.2, fit.3, fit.4, fit.5)
+```
+Based on the ANOVA results, there is evidence to reject the null hypothesis that the simplest model is sufficient. Thus, the GAM with a smoothing spline for each of year, length, and budget, along with linear variables animation, comedy, and drama, is the best model.
+
+We now make predictions on the training set using the best GAM and compute the test MSE.
+```{r}
+gam.train = gam(rating ~ s(year, df = 4) + s(length, df = 4) + s(votes, df = 4) + Animation + Comedy + Drama + s(adjBudget, df = 4), data = train.set)
+gam.test = predict(gam.train, newdata = test.set)
+gam.error = mean((gam.test - test.set$rating)^2)
+gam.error
+```
+The test MSE is 0.944.
+
+#### GAM with Natural Splines
+
+We repeat the process of selecting the best GAM, this time using natural splines instead of smoothing splines. Again, we use the same variables from the best subset selection.
+```{r}
+fit.1 = gam(rating ~ year + length + votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.2 = gam(rating ~ ns(year, df = 4) + length + votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.3 = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.4 = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + ns(votes, df = 4) + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.5 = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + ns(votes, df = 4) + Animation + Comedy + Drama + ns(adjBudget, df = 4), data = movies)
+anova(fit.1, fit.2, fit.3, fit.4, fit.5)
+```
+
+```{r}
+gam.train = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + ns(votes, df = 4) + Animation + Comedy + Drama + ns(adjBudget, df = 4), data = train.set)
+gam.test = predict(gam.train, newdata = test.set)
+gam.error = mean((gam.test - test.set$rating)^2)
+gam.error
+```
+
+The natural splines GAM yields a Test MSE of 0.974.
+
+Thus, the best GAM consists of smoothing splines instead of natural splines. With a test MSE of 0.944, this is the most accurate model at this point in our analysis. 
+
+However, we found in our modeling with polynomial regression and splines that taking the logarithm of the votes improves the accuracy of the model. Is this true for the GAM as well? We repeat the analysis above, substituting the logarithm of the votes for the untransformed votes.
+
+#### GAM with Smoothing Splines and Logarithm of Votes
+```{r}
+fit.1 = gam(rating ~ year + length + log.votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.2 = gam(rating ~ s(year, df = 4) + length + log.votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.3 = gam(rating ~ s(year, df = 4) + s(length, df = 4) + log.votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.4 = gam(rating ~ s(year, df = 4) + s(length, df = 4) + s(log.votes, df = 4) + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.5 = gam(rating ~ s(year, df = 4) + s(length, df = 4) + s(log.votes, df = 4) + Animation + Comedy + Drama + s(adjBudget, df = 4), data = movies)
+anova(fit.1, fit.2, fit.3, fit.4, fit.5)
+```
+
+```{r}
+gam.train = gam(rating ~ s(year, df = 4) + s(length, df = 4) + s(log.votes, df = 4) + Animation + Comedy + Drama + s(adjBudget, df = 4), data = train.set)
+gam.test = predict(gam.train, newdata = test.set)
+gam.error = mean((gam.test - test.set$rating)^2)
+gam.error
+```
+
+Based on the ANOVA table, the best GAM that uses smoothing splines and the logarithmic votes is the most complex, with a spline for year, length, log(votes), and adjBudget. It has a test MSE of 0.937. This is slightly better than the test MSE for the identical model with normal votes instead of log(votes), which had a test MSE of 0.944.
+
+```{r}
+par(mfrow = c(2,4))
+plot(fit.5, se=TRUE, col="red")
+```
+
+The plot of our GAM displays a plot for each variable, showing its individual contribution to the additive model. The standard errors are represented by the dotted lines.
+
+#### GAM with Natural Splines and Logarithm of Votes
+
+```{r}
+fit.1 = gam(rating ~ year + length + log.votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.2 = gam(rating ~ ns(year, df = 4) + length + log.votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.3 = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + log.votes + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.4 = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + ns(log.votes, df = 4) + Animation + Comedy + Drama + adjBudget, data = movies)
+fit.5 = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + ns(log.votes, df = 4) + Animation + Comedy + Drama + ns(adjBudget, df = 4), data = movies)
+anova(fit.1, fit.2, fit.3, fit.4, fit.5)
+```
+
+```{r}
+gam.train = gam(rating ~ ns(year, df = 4) + ns(length, df = 4) + ns(log.votes, df = 4) + Animation + Comedy + Drama + ns(adjBudget, df = 4), data = train.set)
+gam.test = predict(gam.train, newdata = test.set)
+gam.error = mean((gam.test - test.set$rating)^2)
+gam.error
+```
+
+The best GAM that uses natural splines and logarithmic votes has a test MSE of 0.980, making it the least accurate of the GAMs.
+
+We conclude that the GAM with smoothing splines is the best model for predicting the rating of a movie. Furthermore, taking the logarithm of the votes provides a slight improvement to the accuracy of the model; however, the benefit of the logarithm was more substantial in our linear and polynomial regression models.
+
+# Conclusion
+Now that we have performed exploratory analysis on our variables and fitted a number of linear and non-linear models to the data, we can derive some observations from it. First, below we present a summary of the fits on different models, sorted by ascending predicting power (Test MSE).
+
+Model | Variables | Test MSE | R-sq
+--- | --- | --- | ---
+Spline | lg(*votes*) | 1.464 | 0.192
+Natural Splines | lg(*votes*) | 1.460 | 0.192
+Polynomial D3 Regression | lg(*votes*) | 1.460 | 0.187
+Smoothing Splines | lg(*votes*) | 1.457 | *n/a*
+Linear Regression | *year, length, votes, Animation, Comedy, Drama, adjBudget* | 1.089 | 0.396
+Linear Regression | *year, length,* lg(*votes*)*, Animation, Comedy, Drama, adjBudget* | 1.037 | 0.479
+Polynomial D3 Regression | *year, length,* lg(*votes*)*, Animation,Comedy, Drama, adjBudget* | 0.991 | 0.474
+GAM (N. Spline) | *year, length,* lg(*votes*)*, Animation, Comedy, Drama, adjBudget* | 0.979 | *n/a*
+GAM (N. Spline) | *year, length, votes, Animation, Comedy, Drama, adjBudget* | 0.974 | *n/a*
+GAM (S. Splines) | *year, length, votes, Animation, Comedy, Drama, adjBudget* | 0.943 | *n/a*
+GAM (S. Splines) | *year, length,* lg(*votes*)*, Animation, Comedy, Drama, adjBudget* | 0.937 | *n/a*
+
+Throughout this exercise we identified *votes* as the regressor with the greatest exploratory power on any given model, something we noted when we analyzed the correlation matrix. This variable alone, when regressed upon on the Smoothing Splines model, achieved a MSE test error of 1.456 and an $R^2$ of almost 20%, which is relatively high considering the complexity of the dataset.
+
+If we incorporate more variables into our models, specifically those identified by the Best Subset Selection technique, we are able to enhance our predicting power significantly. This technique suggested utilizing a relatively large number of variables (7), which implies that our main concern with this dataset related to the *Bias* component of the MSE.
+
+On the multivariate linear regression and polynomial models, we see the following direction on their coefficients:
+  
+----------- ----- --------- -----
+year        $(-)$ Animation $(+)$
+length      $(+)$ Drama     $(+)$
+votes       $(+)$ adjBudget $(-)$
+Comedy      $(+)$
+----------- ----- --------- -----
+
+In terms of interpretability, some of these signs makes sense and are consistent with what we saw on the correlation matrix: year is negative, while length, votes and Drama are positive. The signs for the other 3 regressors are the opposite ones of the observed on the correlation matrix, but this needs not to be contradictory as our models take into account how all these variables come into play. The GAM and splines models resulted harder to interpret, and we see GAMs performing slightly better than our Polynomial D3 regression.
+
+If we are to favor the *prediction* capabilities of our models, one would think of using the GAM (Smoothed Splines), which combines the power of non-parametric and linear models to provide greater flexibility. However, one should also note that the polynomial model is almost as good, and its *intepretation* is easier, so we would recommend sticking to the multivariate polynomial regression in this case.
+
+For future studies we would recommend incorporating classification techniques into the analysis, as this distinct approach might yield interesting results (while treating rating as a categorical variable, rather than a continuous one).
+
+[^1]: Check code appendix for details.
